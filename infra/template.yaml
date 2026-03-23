@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AI4NG StatusQueryService CloudFormation Template
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+Resources:
+  StatusCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'StatusQueryService-StatusCheck-${Environment}'
+      CodeUri: ../src/lambdas/statusCheck/
+      Handler: app.handler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Events:
+        StatusCheckApi:
+          Type: Api
+          Properties:
+            Path: /status
+            Method: get
+
+Outputs:
+  StatusCheckFunctionArn:
+    Description: ARN of the StatusCheck Lambda function
+    Value: !GetAtt StatusCheckFunction.Arn
+  StatusCheckApiUrl:
+    Description: API Gateway endpoint URL for StatusCheck
+    Value: !Sub 'https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/status'
