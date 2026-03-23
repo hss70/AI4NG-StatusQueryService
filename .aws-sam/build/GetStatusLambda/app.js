@@ -1,151 +1,173 @@
-const { DynamoDBClient, QueryCommand, ScanCommand } = require("@aws-sdk/client-dynamodb");
-const { CloudWatchLogsClient, FilterLogEventsCommand } = require("@aws-sdk/client-cloudwatch-logs");
-const { unmarshall } = require("@aws-sdk/util-dynamodb");
-const classifierLogGroup = process.env.CLASSIFIER_LOG_GROUP;
+const {
+    DynamoDBClient,
+    QueryCommand,
+    GetItemCommand
+} = require("@aws-sdk/client-dynamodb");
+const {
+    CloudWatchLogsClient,
+    FilterLogEventsCommand
+} = require("@aws-sdk/client-cloudwatch-logs");
+const { unmarshall, marshall } = require("@aws-sdk/util-dynamodb");
 
-const ddbClient = new DynamoDBClient();
-const logsClient = new CloudWatchLogsClient();
+const ddbClient = new DynamoDBClient({});
+const logsClient = new CloudWatchLogsClient({});
+
 const tableName = process.env.STATUS_TABLE;
+const classifierLogGroup = process.env.CLASSIFIER_LOG_GROUP;
 
 exports.handler = async (event) => {
     try {
         const path = event.routeKey;
         const queryParams = event.queryStringParameters || {};
 
-        // Route to appropriate handler
-        if (path === 'GET /api/status') {
+        if (path === "GET /api/status") {
             return await getAllSessions(queryParams);
-        } else if (path === 'GET /api/status/{sessionId}') {
-            const sessionId = parseInt(event.pathParameters.sessionId);
+        }
+
+        if (path === "GET /api/status/{sessionId}") {
+            const rawSessionId = event.pathParameters?.sessionId;
+            const sessionId = parseInt(rawSessionId, 10);
+
+            if (!Number.isFinite(sessionId) || sessionId <= 0) {
+                return jsonResponse(400, { error: "Invalid sessionId" });
+            }
+
             return await getSessionById(sessionId);
         }
 
-        return {
-            statusCode: 404,
-            body: JSON.stringify({ error: 'Route not found' })
-        };
-
+        return jsonResponse(404, { error: "Route not found" });
     } catch (error) {
-        console.error('Error:', error);
-        return {
-            statusCode: 500,
-            body: JSON.stringify({ error: error.message })
-        };
+        console.error("Unhandled error:", error);
+        return jsonResponse(500, { error: error.message || "Internal server error" });
     }
 };
 
 async function getSessionById(sessionId) {
     const params = {
         TableName: tableName,
-        IndexName: 'SessionIdIndex',
-        KeyConditionExpression: 'sessionId = :sessionId',
-        ExpressionAttributeValues: {
-            ':sessionId': { N: sessionId.toString() }
-        },
-        Limit: 1
+        Key: {
+            sessionId: { N: sessionId.toString() }
+        }
     };
 
-    const response = await ddbClient.send(new QueryCommand(params));
+    const response = await ddbClient.send(new GetItemCommand(params));
 
-    if (!response.Items || response.Items.length === 0) {
-        return {
-            statusCode: 404,
-            body: JSON.stringify({ error: 'Session not found' })
-        };
+    if (!response.Item) {
+        return jsonResponse(404, { error: "Session not found" });
     }
 
-    const item = unmarshall(response.Items[0]);
+    const item = unmarshall(response.Item);
     const statusInfo = formatStatusItem(item, sessionId);
 
-    // Add ECS logs if available
-    if (statusInfo.status === 'PROCESSING' || statusInfo.status === 'FAILED') {
+    if (statusInfo.status === "PROCESSING" || statusInfo.status === "FAILED") {
         statusInfo.logs = await getECSLogs(sessionId, {
             maxLogs: 50,
-            lookbackMs: 24 * 60 * 60 * 1000, // 24 hours
-            initialLookbackMs: 5 * 60 * 1000,   // start from 5 mins 
+            maxLookbackMs: 24 * 60 * 60 * 1000,
+            initialLookbackMs: 5 * 60 * 1000,
             excludePhrases
         });
     }
 
-    return {
-        statusCode: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(statusInfo)
-    };
+    return jsonResponse(200, statusInfo);
 }
 
 async function getAllSessions(queryParams) {
-    const status = queryParams.status;
+    const status = queryParams.status?.trim();
+    const limit = Math.min(Math.max(parseInt(queryParams.limit || "25", 10) || 25, 1), 100);
+
+    let exclusiveStartKey;
+    if (queryParams.nextToken) {
+        try {
+            exclusiveStartKey = JSON.parse(
+                Buffer.from(queryParams.nextToken, "base64").toString("utf8")
+            );
+        } catch (err) {
+            return jsonResponse(400, { error: "Invalid nextToken" });
+        }
+    }
+
     let params;
 
     if (status) {
-        // Filter by status
         params = {
             TableName: tableName,
-            FilterExpression: '#status = :status',
+            IndexName: "StatusStartTimeIndex",
+            KeyConditionExpression: "#status = :status",
             ExpressionAttributeNames: {
-                '#status': 'status'
+                "#status": "status"
             },
             ExpressionAttributeValues: {
-                ':status': { S: status }
-            }
+                ":status": { S: status }
+            },
+            ScanIndexForward: false,
+            Limit: limit
         };
     } else {
-        // Get all sessions
         params = {
-            TableName: tableName
+            TableName: tableName,
+            IndexName: "EntityTypeStartTimeIndex",
+            KeyConditionExpression: "entityType = :entityType",
+            ExpressionAttributeValues: {
+                ":entityType": { S: "SESSION_STATUS" }
+            },
+            ScanIndexForward: false,
+            Limit: limit
         };
     }
 
-    const response = await ddbClient.send(new ScanCommand(params));
+    if (exclusiveStartKey) {
+        params.ExclusiveStartKey = exclusiveStartKey;
+    }
 
-    const sessions = response.Items.map(item => {
+    const response = await ddbClient.send(new QueryCommand(params));
+
+    const sessions = (response.Items || []).map(item => {
         const unmarshalled = unmarshall(item);
         return formatStatusItem(unmarshalled, unmarshalled.sessionId);
     });
 
-    return {
-        statusCode: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessions, count: sessions.length })
-    };
+    const nextToken = response.LastEvaluatedKey
+        ? Buffer.from(JSON.stringify(response.LastEvaluatedKey), "utf8").toString("base64")
+        : null;
+
+    return jsonResponse(200, {
+        sessions,
+        count: sessions.length,
+        nextToken
+    });
 }
 
 function formatStatusItem(item, sessionId) {
-    // Parse startTime - could be ISO string or Unix timestamp
     let startTimeUnix = 0;
-    let startTimeISO = '';
+    let startTimeISO = "";
 
     if (item.startTime) {
-        if (typeof item.startTime === 'string' && item.startTime.includes('T')) {
-            // ISO string format like "2025-08-20T12:48:20.387Z"
+        if (typeof item.startTime === "string" && item.startTime.includes("T")) {
             const date = new Date(item.startTime);
             startTimeUnix = Math.floor(date.getTime() / 1000);
             startTimeISO = item.startTime;
         } else {
-            // Unix timestamp or number
-            startTimeUnix = parseInt(item.startTime);
-            startTimeISO = new Date(startTimeUnix * 1000).toISOString();
+            startTimeUnix = parseInt(item.startTime, 10) || 0;
+            startTimeISO = startTimeUnix > 0
+                ? new Date(startTimeUnix * 1000).toISOString()
+                : "";
         }
     }
 
-    const statusInfo = {
-        sessionName: item.sessionName || '',
+    return {
+        sessionName: item.sessionName || "",
         sessionId: sessionId || item.sessionId || 0,
-        status: item.status || 'UNKNOWN',
-        userId: item.userId || '',
+        status: item.status || "UNKNOWN",
+        userId: item.userId || "",
         startTime: startTimeUnix,
-        processingDuration: parseInt(item.processingDuration) || 0,
-        resultsPath: item.resultsPath || '',
-        exitCode: parseInt(item.exitCode) || -1,
-        startTimeISO: startTimeISO
+        processingDuration: parseInt(item.processingDuration, 10) || 0,
+        resultsPath: item.resultsPath || "",
+        exitCode: parseInt(item.exitCode, 10) || -1,
+        startTimeISO
     };
-
-    return statusInfo;
 }
 
 const excludePhrases = [
-    // MATLAB/env boilerplate
     "Prep plus (EEG)",
     "Running: Finished",
     "Set env:",
@@ -160,14 +182,12 @@ const excludePhrases = [
     "dir0 =",
     "SubjID2:",
     "BandID:",
-
-    // repetitive loads/saves noise
     "Dataset loading: DONE",
     "Loading A10_offlineClass_prep_01",
     "Loading A09_EEG_validation_01",
     "Loading EEG_rec dataset",
-    "Loading tr{",                 // e.g. Loading tr{1,1}.mat ...
-    "At /app/work/Work/TrainTest", // path echo
+    "Loading tr{",
+    "At /app/work/Work/TrainTest",
     "Saving config structure",
     "Saving autorun structure",
     "Saving EEG_validation structure",
@@ -179,8 +199,6 @@ const excludePhrases = [
     "Saving t1_result_table",
     "Saving online structure",
     "Autosave (it may take some minutes)",
-
-    // plot/figure chatter
     "Saved JSON config:",
     "CSP-MI topoplot",
     "DA plot",
@@ -191,14 +209,11 @@ const excludePhrases = [
     "TAv2_TrainTest",
     "T1_proper",
     "FBCSP_Training",
-
-    // S3 transfer/manifest spam
     "Adding to manifest:",
-    "upload: ",                    // S3 sync lines
-    "Completed ",                  // progress counters
+    "upload: ",
+    "Completed ",
     "download: s3://"
 ];
-
 
 function escapeRegExp(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -208,21 +223,28 @@ async function getECSLogs(
     sessionId,
     {
         maxLogs = 50,
-        maxLookbackMs = 24 * 60 * 60 * 1000, // hard cap
-        initialLookbackMs = 5 * 60 * 1000,   // start small
+        maxLookbackMs = 24 * 60 * 60 * 1000,
+        initialLookbackMs = 5 * 60 * 1000,
         excludePhrases = []
     } = {}
 ) {
+    if (!classifierLogGroup) {
+        console.warn("CLASSIFIER_LOG_GROUP not set");
+        return [];
+    }
+
     const negatives = excludePhrases
         .filter(Boolean)
         .map(p => `-"${p.replace(/"/g, '\\"')}"`)
         .join(" ");
+
     const baseFilter = `"[SESSION_ID=${sessionId}]" ${negatives}`.trim();
 
     const excludeRegexes = [
         /^\s*\[SESSION_ID=\d+\]\s*$/i,
-        ...excludePhrases.map(s => new RegExp(escapeRegExp(s), "i")),
+        ...excludePhrases.map(s => new RegExp(escapeRegExp(s), "i"))
     ];
+
     const isNoise = m => excludeRegexes.some(rx => rx.test(m || ""));
 
     let lookback = initialLookbackMs;
@@ -242,7 +264,7 @@ async function getECSLogs(
                 endTime: Date.now(),
                 interleaved: true,
                 limit: 1000,
-                nextToken,
+                nextToken
             }));
 
             if (resp?.events?.length) {
@@ -253,20 +275,32 @@ async function getECSLogs(
                     }
                 }
             }
+
             nextToken = resp.nextToken;
         } while (nextToken);
 
-        // If we’ve got enough (in this window), stop; otherwise expand window.
-        if (collected.length >= maxLogs || lookback >= maxLookbackMs) break;
+        if (collected.length >= maxLogs || lookback >= maxLookbackMs) {
+            break;
+        }
 
-        // expand window and try again
         lookback = Math.min(lookback * 2, maxLookbackMs);
-        collected = []; // reset so we don’t double-count across different windows
+        collected = [];
     }
 
     collected.sort((a, b) => a.timestamp - b.timestamp);
+
     return collected.slice(-maxLogs).reverse().map(e => ({
         timestamp: new Date(e.timestamp).toISOString(),
-        message: (e.message || "").trim(),
+        message: (e.message || "").trim()
     }));
+}
+
+function jsonResponse(statusCode, body) {
+    return {
+        statusCode,
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+    };
 }

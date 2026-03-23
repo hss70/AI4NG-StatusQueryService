@@ -1,0 +1,10 @@
+version = 0.1
+[default.deploy.parameters]
+stack_name = "AI4NG-StatusQuery-dev-test"
+s3_bucket = "ai4ng-dev-sam-artifacts-047719656259"
+s3_prefix = "AI4NG-StatusQuery-dev-test"
+region = "eu-west-2"
+confirm_changeset = false
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+image_repositories = []
+parameter_overrides = "Environment=dev"
