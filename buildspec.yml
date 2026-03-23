@@ -17,7 +17,7 @@ phases:
       - sam package
         --template-file .aws-sam/build/template.yaml
         --s3-bucket $ARTIFACT_BUCKET
-        --s3-prefix AI4NG-ClassiferLambdaApi-$Environment
+        --s3-prefix AI4NG-StatusQueryService-$Environment
         --output-template-file packaged.yaml
 
 artifacts:
