@@ -1,0 +1,26 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      dotnet: 8.0
+    commands:
+      - pip install aws-sam-cli
+
+  pre_build:
+    commands:
+      - ARTIFACT_BUCKET=$(aws cloudformation list-exports --query "Exports[?Name=='AI4NG-dev-SamArtifactBucketName'].Value" --output text)
+
+  build:
+    commands:
+      - sam build --template-file infra/template.yaml
+      - sam package
+        --template-file .aws-sam/build/template.yaml
+        --s3-bucket $ARTIFACT_BUCKET
+        --s3-prefix AI4NG-ClassiferLambdaApi-$Environment
+        --output-template-file packaged.yaml
+
+artifacts:
+  files:
+    - packaged.yaml
+    - infra/parameters/dev.json

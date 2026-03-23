@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AI4NG StatusQueryService CloudFormation Template
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+    - dev
+    - staging
+    - prod
+    Description: Deployment environment
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 128
+    Runtime: nodejs22.x
+Resources:
+  GetStatusLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/ai4ng-${Environment}-status-query
+      RetentionInDays: 14
+  GetStatusLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ai4ng-${Environment}-status-query-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName:
+          Fn::Sub: ai4ng-${Environment}-status-query-inline
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: ReadProcessingStatusTable
+            Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:BatchGetItem
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:DescribeTable
+            Resource:
+            - Fn::ImportValue:
+                Fn::Sub: AI4NG-${Environment}-ProcessingStatusTableArn
+            - Fn::Sub:
+              - ${TableArn}/index/*
+              - TableArn:
+                  Fn::ImportValue:
+                    Fn::Sub: AI4NG-${Environment}-ProcessingStatusTableArn
+          - Sid: FilterClassifierLogs
+            Effect: Allow
+            Action:
+            - logs:FilterLogEvents
+            Resource:
+              Fn::Sub:
+              - arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}:*
+              - LogGroupName:
+                  Fn::ImportValue:
+                    Fn::Sub: AI4NG-${Environment}-ClassifierLogGroupName
+      Tags:
+      - Key: Project
+        Value: AI4NG
+      - Key: Environment
+        Value:
+          Ref: Environment
+  GetStatusLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: ai4ng-${Environment}-status-query
+      Role:
+        Fn::GetAtt:
+        - GetStatusLambdaRole
+        - Arn
+      CodeUri: GetStatusLambda
+      Handler: app.handler
+      Environment:
+        Variables:
+          STATUS_TABLE:
+            Fn::ImportValue:
+              Fn::Sub: AI4NG-${Environment}-ProcessingStatusTableName
+          CLASSIFIER_LOG_GROUP:
+            Fn::ImportValue:
+              Fn::Sub: AI4NG-${Environment}-ClassifierLogGroupName
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup:
+          Ref: GetStatusLogGroup
+      Tags:
+        Project: AI4NG
+        Environment:
+          Ref: Environment
+    Metadata:
+      SamResourceId: GetStatusLambda
+  StatusIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId:
+        Fn::ImportValue:
+          Fn::Sub: AI4NG-${Environment}-SharedHttpApiId
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::GetAtt:
+        - GetStatusLambda
+        - Arn
+      PayloadFormatVersion: '2.0'
+      IntegrationMethod: POST
+  StatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Fn::ImportValue:
+          Fn::Sub: AI4NG-${Environment}-SharedHttpApiId
+      RouteKey: GET /api/status/{sessionId}
+      AuthorizationType: JWT
+      AuthorizerId:
+        Fn::ImportValue:
+          Fn::Sub: AI4NG-${Environment}-ParticipantAuthorizerId
+      Target:
+        Fn::Sub: integrations/${StatusIntegration}
+  StatusAllRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Fn::ImportValue:
+          Fn::Sub: AI4NG-${Environment}-SharedHttpApiId
+      RouteKey: GET /api/status
+      AuthorizationType: JWT
+      AuthorizerId:
+        Fn::ImportValue:
+          Fn::Sub: AI4NG-${Environment}-ParticipantAuthorizerId
+      Target:
+        Fn::Sub: integrations/${StatusIntegration}
+  GetStatusLambdaPermissionRoot:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: GetStatusLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub:
+        - arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiId}/*/GET/api/status
+        - ApiId:
+            Fn::ImportValue:
+              Fn::Sub: AI4NG-${Environment}-SharedHttpApiId
+  GetStatusLambdaPermissionSubpaths:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: GetStatusLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub:
+        - arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiId}/*/GET/api/status/*
+        - ApiId:
+            Fn::ImportValue:
+              Fn::Sub: AI4NG-${Environment}-SharedHttpApiId
+Outputs:
+  GetStatusLambdaName:
+    Description: Name of the status query Lambda
+    Value:
+      Ref: GetStatusLambda
+    Export:
+      Name:
+        Fn::Sub: AI4NG-${Environment}-GetStatusLambdaName
+  GetStatusLambdaArn:
+    Description: ARN of the status query Lambda
+    Value:
+      Fn::GetAtt:
+      - GetStatusLambda
+      - Arn
+    Export:
+      Name:
+        Fn::Sub: AI4NG-${Environment}-GetStatusLambdaArn
+  GetStatusLambdaRoleArn:
+    Description: ARN of the status query Lambda role
+    Value:
+      Fn::GetAtt:
+      - GetStatusLambdaRole
+      - Arn
+    Export:
+      Name:
+        Fn::Sub: AI4NG-${Environment}-GetStatusLambdaRoleArn
+  GetStatusLogGroupName:
+    Description: Log group for the status query Lambda
+    Value:
+      Ref: GetStatusLogGroup
+    Export:
+      Name:
+        Fn::Sub: AI4NG-${Environment}-GetStatusLogGroupName
